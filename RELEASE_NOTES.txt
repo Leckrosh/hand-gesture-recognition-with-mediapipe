@@ -1,0 +1,25 @@
+- Added Logic for only data collector (Data Gathering Mode)
+- Added logic for selecting keypoint classifier model.
+
+HGR - 01/15/2025 (English)
+Release 1.0.1
+
+- Modified general directory structure (Refactor over model directory)
+- Added keypoint classifier model zoo
+- Change of point history circle color to blue
+- Added keypoint_classifier_confidence to argparse parameters
+- Added keypoint_model to argparse for selecting keypoint classifier from model zoo
+- Added installation packages procedure in both Jupyter notebooks
+- Modified palm drawed landmark
+- README modifications
+
+
+HGR - 01/13/2025 (English)
+Release 1.0.0
+
+- Added an output=[] empty list for avoiding initial crash if hand detected.
+- Change Keypoint history circle color to 152, 52, 52 (Blue)
+- Added more details over argparse help
+- Added Requirements.txt
+- Added image saver for dataset reference
+- Added undefined classification category for keypoint classifier models

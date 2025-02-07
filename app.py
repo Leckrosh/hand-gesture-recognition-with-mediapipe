@@ -1,9 +1,8 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 import csv
 import copy
 import argparse
 import itertools
+import uuid, os
 from collections import Counter
 from collections import deque
 
@@ -18,20 +17,27 @@ from model import PointHistoryClassifier
 
 def get_args():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--device", type=int, default=0)
+    #Webcam Index
+    parser.add_argument("--device", help="Webcam Index", type=int, default=0)
+    #Camera Width
     parser.add_argument("--width", help='cap width', type=int, default=960)
+    #Camera height
     parser.add_argument("--height", help='cap height', type=int, default=540)
 
-    parser.add_argument('--use_static_image_mode', action='store_true')
+    parser.add_argument('--use_static_image_mode', help="Enables processing for static mode images", action='store_true')
+    parser.add_argument('--only_data_collector', help="Feature only for capturing new data for training", action='store_true')
+    parser.add_argument('--train_new_model', help="Generate an entire new model", type=str)
+    parser.add_argument("--keypoint_model", help='Select Keypoint model classifier', type=str, default="Kazuhito00")
+    parser.add_argument("--point_history_model", help='Select Keypoint history model classifier', type=str, default="Kazuhito00")
     parser.add_argument("--min_detection_confidence",
-                        help='min_detection_confidence',
+                        help='Threshold for mininmum detection confidence for hand detection [0.0, 1.0]',
                         type=float,
                         default=0.7)
     parser.add_argument("--min_tracking_confidence",
-                        help='min_tracking_confidence',
+                        help='Threshold for minimum tracking confidence for hand tracking [0.0, 1.0]',
                         type=int,
                         default=0.5)
+    parser.add_argument("--keypoint_classifier_confidence", help='Threshold for minimum for keypoint inference [0.00, 1.00]', type=float, default=0.80)
 
     args = parser.parse_args()
 
@@ -39,25 +45,50 @@ def get_args():
 
 
 def main():
-    # 引数解析 #################################################################
     args = get_args()
 
     cap_device = args.device
     cap_width = args.width
     cap_height = args.height
 
+    train_new_model = args.train_new_model
+
+    only_data_collector = args.only_data_collector
     use_static_image_mode = args.use_static_image_mode
+    model = args.keypoint_model
+    classifier_model = args.point_history_model
     min_detection_confidence = args.min_detection_confidence
     min_tracking_confidence = args.min_tracking_confidence
 
+    keypoint_threshold = args.keypoint_classifier_confidence
+
+    if train_new_model is not None:
+        only_data_collector=True
+        model=train_new_model
+        classifier_model=train_new_model
+        keypoint_path = f'model/keypoint_classifier_models/{model}'
+        point_history_path = f'model/point_history_classifier_models/{classifier_model}'
+        paths = [(keypoint_path, "keypoint"), (point_history_path, "point_history")]
+
+        for dir, model_type in paths:
+            if os.path.exists(dir):
+                print(f"The model '{model}' already exists, please assign another name")
+                quit()
+            os.makedirs(dir)
+            with open(f'{dir}/{model_type}_classifier_label.csv', 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["None"])
+            with open(f'{dir}/{model_type}.csv', 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([])
+
     use_brect = True
 
-    # カメラ準備 ###############################################################
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-    # モデルロード #############################################################
+    # Model load #############################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
@@ -65,56 +96,60 @@ def main():
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
+    print(only_data_collector, "Hello")
 
-    keypoint_classifier = KeyPointClassifier()
+    if only_data_collector!=True:
+        keypoint_classifier = KeyPointClassifier(model=model)
+        point_history_classifier = PointHistoryClassifier(model=classifier_model)
 
-    point_history_classifier = PointHistoryClassifier()
-
-    # ラベル読み込み ###########################################################
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
+    # Read labels ###########################################################
+    with open(f'model/keypoint_classifier_models/{model}/keypoint_classifier_label.csv',
               encoding='utf-8-sig') as f:
         keypoint_classifier_labels = csv.reader(f)
         keypoint_classifier_labels = [
             row[0] for row in keypoint_classifier_labels
         ]
-    with open(
-            'model/point_history_classifier/point_history_classifier_label.csv',
-            encoding='utf-8-sig') as f:
+    with open(f'model/point_history_classifier_models/{classifier_model}/point_history_classifier_label.csv',
+        encoding='utf-8-sig') as f:
         point_history_classifier_labels = csv.reader(f)
         point_history_classifier_labels = [
             row[0] for row in point_history_classifier_labels
         ]
 
-    # FPS計測モジュール ########################################################
+    print ("files read")
+    # FPS Measurement ########################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # 座標履歴 #################################################################
+    # Coordinate history #################################################################
     history_length = 16
     point_history = deque(maxlen=history_length)
 
-    # フィンガージェスチャー履歴 ################################################
+    # Finger gesture history ################################################
     finger_gesture_history = deque(maxlen=history_length)
 
     #  ########################################################################
     mode = 0
 
+    #Output initializer for avoiding crash
+    output=[]
+
     while True:
         fps = cvFpsCalc.get()
 
-        # キー処理(ESC：終了) #################################################
+        # Process Key (ESC: end) #################################################
         key = cv.waitKey(10)
         if key == 27:  # ESC
             break
         number, mode = select_mode(key, mode)
 
-        # カメラキャプチャ #####################################################
+        # Camera capture #####################################################
         ret, image = cap.read()
         if not ret:
             break
-        image = cv.flip(image, 1)  # ミラー表示
+        image = cv.flip(image, 1)  # Mirror display
         debug_image = copy.deepcopy(image)
 
-        # 検出実施 #############################################################
+        # Detection implementation #############################################################
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
         image.flags.writeable = False
@@ -122,60 +157,121 @@ def main():
         image.flags.writeable = True
 
         #  ####################################################################
-        if results.multi_hand_landmarks is not None:
+        if results.multi_hand_landmarks is not None and output!=[] and only_data_collector is not True:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
                                                   results.multi_handedness):
-                # 外接矩形の計算
+                # Bounding box calculation
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # ランドマークの計算
+                # Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-                # 相対座標・正規化座標への変換
+                # Conversion to relative coordinates / normalized coordinates
                 pre_processed_landmark_list = pre_process_landmark(
                     landmark_list)
                 pre_processed_point_history_list = pre_process_point_history(
                     debug_image, point_history)
-                # 学習データ保存
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
+                # Write to the dataset file
+                logging_csv(model, classifier_model, number, mode, pre_processed_landmark_list,
+                            pre_processed_point_history_list, output)
 
-                # ハンドサイン分類
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                if hand_sign_id == 2:  # 指差しサイン
-                    point_history.append(landmark_list[8])  # 人差指座標
+                # Hand sign classification
+                hand_sign_id = keypoint_classifier(pre_processed_landmark_list, keypoint_threshold)
+                if hand_sign_id == 2:  # Point gesture
+                    #point_history.append(landmark_list[12])
+                    point_history.append(landmark_list[8])
+                    #point_history.append(landmark_list[20])
                 else:
-                    point_history.append([0, 0])
+                    if len(point_history) > 0:
+                        point_history.popleft()
 
-                # フィンガージェスチャー分類
-                finger_gesture_id = 0
+                # Finger gesture classification
                 point_history_len = len(pre_processed_point_history_list)
                 if point_history_len == (history_length * 2):
                     finger_gesture_id = point_history_classifier(
                         pre_processed_point_history_list)
+                    finger_gesture_history.append(finger_gesture_id)
+                    most_common_fg_id = Counter(finger_gesture_history).most_common()
+                else:
+                    finger_gesture_id = 10
+                    finger_gesture_history.append(finger_gesture_id)
+                    most_common_fg_id = Counter(finger_gesture_history).most_common()
 
-                # 直近検出の中で最多のジェスチャーIDを算出
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
+                # Drawing part
+                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+                debug_image = draw_landmarks(debug_image, landmark_list)
+                if hand_sign_id != 10 and most_common_fg_id[0][0]!=10:
+                    debug_image = draw_info_text(
+                        debug_image,
+                        brect,
+                        handedness,
+                        keypoint_classifier_labels[hand_sign_id],
+                        point_history_classifier_labels[most_common_fg_id[0][0]],
+                    )
+                elif hand_sign_id != 10 and most_common_fg_id[0][0]==10:
+                    debug_image = draw_info_text(
+                        debug_image,
+                        brect,
+                        handedness,
+                        keypoint_classifier_labels[hand_sign_id],
+                        "UNDEFINED",
+                    )
+                elif hand_sign_id == 10 and most_common_fg_id[0][0]!=10:
+                    debug_image = draw_info_text(
+                        debug_image,
+                        brect,
+                        handedness,
+                        "UND",
+                        point_history_classifier_labels[most_common_fg_id[0][0]],
+                    )
+                else:
+                    debug_image = draw_info_text(
+                        debug_image,
+                        brect,
+                        handedness,
+                        "UND",
+                        "UNDEFINED",
+                    )
+        elif results.multi_hand_landmarks is not None and output!=[] and (only_data_collector==True):
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+                                                  results.multi_handedness):
+                # Bounding box calculation
+                brect = calc_bounding_rect(debug_image, hand_landmarks)
+                # Landmark calculation
+                landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-                # 描画
+                # Conversion to relative coordinates / normalized coordinates
+                pre_processed_landmark_list = pre_process_landmark(
+                    landmark_list)
+                pre_processed_point_history_list = pre_process_point_history(
+                    debug_image, point_history)
+                # Write to the dataset file
+                logging_csv(model, classifier_model, number, mode, pre_processed_landmark_list,
+                            pre_processed_point_history_list, output)
+
+                point_history.append(landmark_list[8])
+
+                # Finger gesture classification
+                point_history_len = len(pre_processed_point_history_list)
+
+                # Drawing part
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
                 debug_image = draw_info_text(
                     debug_image,
                     brect,
                     handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                    "UND",
+                    "UNDEFINED",
                 )
         else:
-            point_history.append([0, 0])
-
+            if len(point_history) > 0:
+                point_history.append([0, 0])
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, fps, mode, number)
+        output = debug_image
 
-        # 画面反映 #############################################################
-        cv.imshow('Hand Gesture Recognition', debug_image)
+        # Screen reflection #############################################################
+        cv.imshow('Hand Gesture Recognition', output)
 
     cap.release()
     cv.destroyAllWindows()
@@ -217,7 +313,7 @@ def calc_landmark_list(image, landmarks):
 
     landmark_point = []
 
-    # キーポイント
+    # Keypoint
     for _, landmark in enumerate(landmarks.landmark):
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
@@ -231,7 +327,7 @@ def calc_landmark_list(image, landmarks):
 def pre_process_landmark(landmark_list):
     temp_landmark_list = copy.deepcopy(landmark_list)
 
-    # 相対座標に変換
+    # Convert to relative coordinates
     base_x, base_y = 0, 0
     for index, landmark_point in enumerate(temp_landmark_list):
         if index == 0:
@@ -240,11 +336,11 @@ def pre_process_landmark(landmark_list):
         temp_landmark_list[index][0] = temp_landmark_list[index][0] - base_x
         temp_landmark_list[index][1] = temp_landmark_list[index][1] - base_y
 
-    # 1次元リストに変換
+    # Convert to a one-dimensional list
     temp_landmark_list = list(
         itertools.chain.from_iterable(temp_landmark_list))
 
-    # 正規化
+    # Normalization
     max_value = max(list(map(abs, temp_landmark_list)))
 
     def normalize_(n):
@@ -260,7 +356,7 @@ def pre_process_point_history(image, point_history):
 
     temp_point_history = copy.deepcopy(point_history)
 
-    # 相対座標に変換
+    # Convert to relative coordinates
     base_x, base_y = 0, 0
     for index, point in enumerate(temp_point_history):
         if index == 0:
@@ -271,33 +367,51 @@ def pre_process_point_history(image, point_history):
         temp_point_history[index][1] = (temp_point_history[index][1] -
                                         base_y) / image_height
 
-    # 1次元リストに変換
+    # Convert to a one-dimensional list
     temp_point_history = list(
         itertools.chain.from_iterable(temp_point_history))
 
     return temp_point_history
+    
 
 
-def logging_csv(number, mode, landmark_list, point_history_list):
+def logging_csv(model, model2, number, mode, landmark_list, point_history_list, frame):
     if mode == 0:
         pass
     if mode == 1 and (0 <= number <= 9):
-        csv_path = 'model/keypoint_classifier/keypoint.csv'
+        csv_path = f'model/keypoint_classifier_models/{model}/keypoint.csv'
+        id=uuid.uuid4().hex
         with open(csv_path, 'a', newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([number, *landmark_list])
+            writer.writerow([id, number, *landmark_list])
+        
+        # Save the frame as an image
+        image_path = f'model/keypoint_classifier_models/{model}/image_ref/{number}_keypoint_{id}.jpg'
+        cv.imwrite(image_path, frame)
+
     if mode == 2 and (0 <= number <= 9):
-        csv_path = 'model/point_history_classifier/point_history.csv'
+        import os
+        csv_path = f'model/point_history_classifier_models/{model2}/point_history.csv'
+        id = uuid.uuid4().hex
         with open(csv_path, 'a', newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([number, *point_history_list])
+            writer.writerow([id, number, *point_history_list])
+        
+        # Save the frame as an image
+        folder_path = f'model/point_history_classifier_models/{model2}/image_ref/'
+        os.makedirs(folder_path, exist_ok=True)
+        image_path = os.path.join(folder_path, f'{number}_history_{id}.jpg')
+        cv.imwrite(image_path, frame)
     return
 
 
 def draw_landmarks(image, landmark_point):
-    # 接続線
     if len(landmark_point) > 0:
-        # 親指
+        # Thumb
+        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
+                (0, 0, 0), 6)
+        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
+                (255, 255, 255), 2)
         cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]),
                 (0, 0, 0), 6)
         cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]),
@@ -307,7 +421,7 @@ def draw_landmarks(image, landmark_point):
         cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]),
                 (255, 255, 255), 2)
 
-        # 人差指
+        # Index finger
         cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]),
                 (0, 0, 0), 6)
         cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]),
@@ -321,7 +435,7 @@ def draw_landmarks(image, landmark_point):
         cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]),
                 (255, 255, 255), 2)
 
-        # 中指
+        # Middle finger
         cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]),
                 (0, 0, 0), 6)
         cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]),
@@ -335,7 +449,7 @@ def draw_landmarks(image, landmark_point):
         cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]),
                 (255, 255, 255), 2)
 
-        # 薬指
+        # Ring finger
         cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]),
                 (0, 0, 0), 6)
         cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]),
@@ -349,7 +463,7 @@ def draw_landmarks(image, landmark_point):
         cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]),
                 (255, 255, 255), 2)
 
-        # 小指
+        # Little finger
         cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]),
                 (0, 0, 0), 6)
         cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]),
@@ -363,18 +477,14 @@ def draw_landmarks(image, landmark_point):
         cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]),
                 (255, 255, 255), 2)
 
-        # 手の平
+        # Palm
         cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]),
                 (0, 0, 0), 6)
         cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]),
                 (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
+        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[5]),
                 (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]),
+        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[5]),
                 (255, 255, 255), 2)
         cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]),
                 (0, 0, 0), 6)
@@ -393,89 +503,89 @@ def draw_landmarks(image, landmark_point):
         cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]),
                 (255, 255, 255), 2)
 
-    # キーポイント
+    # Key Points
     for index, landmark in enumerate(landmark_point):
-        if index == 0:  # 手首1
+        if index == 0:  # Wrist 1 ~> Lunate
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 255, 255),
+                      -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 1:  # Wrist 2 ~> Scaphoid
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 1:  # 手首2
+        if index == 2:  # Thumb：Base ~> Carpometacarpal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 2:  # 親指：付け根
+        if index == 3:  # Thumb: 1st Joint ~> Metacarpophalangeal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 3:  # 親指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 4:  # 親指：指先
+        if index == 4:  # Thumb: Point ~> Distal Phalanx
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 5:  # 人差指：付け根
+        if index == 5:  # Index: Base ~> Carpometacarpal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 6:  # 人差指：第2関節
+        if index == 6:  # Index：1st Joint ~> Metacarpophalangeal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 7:  # 人差指：第1関節
+        if index == 7:  # Index：2nd Joint ~> Proximal Interphalangeal Joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 8:  # 人差指：指先
+        if index == 8:  # Index: Point ~> Distal Phalanx
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 9:  # 中指：付け根
+        if index == 9:  # Middle: Base ~> Carpometacarpal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 10:  # 中指：第2関節
+        if index == 10:  # Middle：1st Joint ~> Metacarpophalangeal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 11:  # 中指：第1関節
+        if index == 11:  # Middle：2nd Joint ~> Proximal Interphalangeal Joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 12:  # 中指：指先
+        if index == 12:  # Middle: Point ~> Distal Phalanx
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 13:  # 薬指：付け根
+        if index == 13:  # Ring: Base ~> Carpometacarpal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 14:  # 薬指：第2関節
+        if index == 14:  # Ring：1st Joint ~> Metacarpophalangeal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 15:  # 薬指：第1関節
+        if index == 15:  # Ring：2nd Joint ~> Proximal Interphalangeal Joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 16:  # 薬指：指先
+        if index == 16:  # Ring: Point ~> Distal Phalanx
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 17:  # 小指：付け根
+        if index == 17:  # Little: Base ~> Carpometacarpal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 18:  # 小指：第2関節
+        if index == 18:  # Little：1st Joint ~> Metacarpophalangeal joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 19:  # 小指：第1関節
+        if index == 19:  # Little：2nd Joint ~> Proximal Interphalangeal Joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 20:  # 小指：指先
+        if index == 20:  # Little: Point ~> Distal Phalanx
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
@@ -485,7 +595,7 @@ def draw_landmarks(image, landmark_point):
 
 def draw_bounding_rect(use_brect, image, brect):
     if use_brect:
-        # 外接矩形
+        # Outer rectangle
         cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]),
                      (0, 0, 0), 1)
 
@@ -503,7 +613,7 @@ def draw_info_text(image, brect, handedness, hand_sign_text,
     cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
                cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
 
-    if finger_gesture_text != "":
+    if finger_gesture_text !="UNDEFINED" and finger_gesture_text != "":
         cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
                    cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
         cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
@@ -517,7 +627,7 @@ def draw_point_history(image, point_history):
     for index, point in enumerate(point_history):
         if point[0] != 0 and point[1] != 0:
             cv.circle(image, (point[0], point[1]), 1 + int(index / 2),
-                      (152, 251, 152), 2)
+                      (152, 52, 52), 2)
 
     return image
 
